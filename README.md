@@ -61,3 +61,25 @@ High-Speed enumeration and full console redirection remain separate checks.
 Only its HS USB shutdown workaround is used here, not its auto-download logic.
 The original Hello World pytest was removed because it no longer describes
 this firmware. Acceptance requires a physical USB host and board.
+
+## CDC standard console
+
+The application calls tinyusb_console_init after CDC initialization,
+matching the factory firmware's console hookup. printf, stderr and normal
+ESP_LOG output after initialization use CDC. The existing task still owns
+RX and echoes via fwrite on stdout; do not add another stdin reader.
+
+The resolved local esp_tinyusb version is 3.0.0 (see dependencies.lock).
+This supersedes the earlier note that dependency resolution is pending.
+
+After the user builds/flashes, enable DTR and expect both [printf] and
+[ESP_LOGI] lines every second. Echo, close/reopen and unplug/replug must
+still work. Startup messages before CDC initialization and ROM/panic output
+are not guaranteed on this application USB interface. Initial messages can
+be missed before the host opens its port; periodic lines provide validation.
+
+The component VFS uses nonblocking TX. A slow or absent host can lose output;
+this is live logging without history or a delivery guarantee. echo_tx_dropped
+only counts short echo writes, not lost log bytes. TX newline conversion is
+LF (unchanged bytes), preserving exact echo, and printf supplies explicit CRLF.
+The agent did not build or flash this console change; hardware validation remains a user step.

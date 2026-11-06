@@ -12,6 +12,8 @@
 #include "tinyusb.h"
 #include "tinyusb_cdc_acm.h"
 #include "tinyusb_default_config.h"
+#include "tinyusb_console.h"
+#include "vfs_tinyusb.h"
 #include "tusb.h"
 #include "device/dcd.h"
 
@@ -34,22 +36,6 @@ static void cdc_rx_callback(int itf, cdcacm_event_t *event)
     xTaskNotifyGive(s_app_task);
 }
 
-static void cdc_send(const uint8_t *data, size_t length)
-{
-    const TickType_t start = xTaskGetTickCount();
-    size_t sent = 0;
-    while (sent < length && tud_cdc_n_connected(0)
-           && (xTaskGetTickCount() - start) < pdMS_TO_TICKS(100)) {
-        sent += tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0,
-                                          data + sent, length - sent);
-        (void)tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, pdMS_TO_TICKS(20));
-        if (sent < length) {
-            vTaskDelay(1);
-        }
-    }
-    s_tx_dropped += length - sent;
-}
-
 void app_main(void)
 {
     s_app_task = xTaskGetCurrentTaskHandle();
@@ -61,7 +47,13 @@ void app_main(void)
         .callback_rx = cdc_rx_callback,
     };
     ESP_ERROR_CHECK(tinyusb_cdcacm_init(&cdc_config));
-    ESP_LOGI("usb_cdc", "CDC ready: open the application COM port with DTR enabled");
+    /* Only this task reads RX; do not add a competing stdin reader. */
+    ESP_ERROR_CHECK(tinyusb_console_init(TINYUSB_CDC_ACM_0));
+    /* Preserve echoed CR/LF bytes; printf below supplies its own CRLF. */
+    esp_vfs_tusb_cdc_set_tx_line_endings(ESP_LINE_ENDINGS_LF);
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+    ESP_LOGI("usb_cdc", "CDC console ready: printf and ESP_LOG now use USB");
 
     uint8_t rx[CONFIG_TINYUSB_CDC_RX_BUFSIZE];
     TickType_t last_status = xTaskGetTickCount();
@@ -72,21 +64,22 @@ void app_main(void)
         size_t received = 0;
         ESP_ERROR_CHECK(tinyusb_cdcacm_read(TINYUSB_CDC_ACM_0, rx,
                                            sizeof(rx), &received));
-        if (received > 0) {
-            cdc_send(rx, received);
+        if (received > 0 && tud_cdc_n_connected(0)) {
+            /* Use stdout's serialization, shared with printf and ESP_LOG. */
+            clearerr(stdout);
+            size_t written = fwrite(rx, 1, received, stdout);
+            s_tx_dropped += received - written;
         }
         const TickType_t now = xTaskGetTickCount();
         if (now - last_status >= pdMS_TO_TICKS(1000)) {
             last_status = now;
             if (tud_cdc_n_connected(0)) {
-                char status[160];
-                int length = snprintf(status, sizeof(status),
-                                      "\r\n[CDC] alive=%" PRIu32
-                                      " heap=%" PRIu32 " tx_dropped=%" PRIu32 "\r\n",
-                                      ++status_count, esp_get_free_heap_size(), s_tx_dropped);
-                if (length > 0 && length < (int)sizeof(status)) {
-                    cdc_send((const uint8_t *)status, (size_t)length);
-                }
+                clearerr(stdout);
+                printf("\r\n[printf] alive=%" PRIu32 " heap=%" PRIu32
+                       " echo_tx_dropped=%" PRIu32 "\r\n",
+                       ++status_count, esp_get_free_heap_size(), s_tx_dropped);
+                ESP_LOGI("usb_cdc", "[ESP_LOGI] CDC console alive=%" PRIu32,
+                         status_count);
             }
         }
     }
