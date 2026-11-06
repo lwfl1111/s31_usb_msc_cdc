@@ -1,53 +1,63 @@
-| Supported Targets | ESP32 | ESP32-C2 | ESP32-C3 | ESP32-C5 | ESP32-C6 | ESP32-C61 | ESP32-H2 | ESP32-H21 | ESP32-H4 | ESP32-P4 | ESP32-S2 | ESP32-S3 | ESP32-S31 | Linux |
-| ----------------- | ----- | -------- | -------- | -------- | -------- | --------- | -------- | --------- | -------- | -------- | -------- | -------- | --------- | ----- |
+# ESP32-S31 USB CDC bring-up
 
-# Hello World Example
+Phase 1 for ESP-Mosaico: one TinyUSB CDC-ACM interface, byte echo and a
+status line every second. No MSC or automatic download yet.
 
-Starts a FreeRTOS task to print "Hello World".
+## Environment and dependencies
 
-(See the README.md file in the upper level 'examples' directory for more information about examples.)
+- Local ESP-IDF: D:/esp_idf/master/esp-idf, 6.2.0, commit d445e947.
+- Target: esp32s31.
+- main/idf_component.yml follows the local tusb_serial_device example:
+  esp_tinyusb ~3.0.0. The actual patch and transitive TinyUSB versions will
+  be resolved on the user's first configure/build. Commit dependencies.lock
+  after successful dependency resolution; it has not been generated yet.
+- sdkconfig is tracked to preserve the working board configuration.
+- sdkconfig.defaults adds the CDC settings for fresh configurations. It is
+  not a complete replacement for the tracked board configuration.
+- Existing 2 MB flash configuration and single-app partition table are unchanged.
 
-## How to use example
+## User build and flash
 
-Follow detailed instructions provided specifically for this example.
+The agent has not configured, compiled, linked, generated firmware, or flashed.
+Use the same ESP-IDF environment and flashing method that worked for Hello World.
+The first build needs network access to download the managed USB components.
 
-Select the instructions depending on Espressif chip installed on your development board:
+1. Build from the ESP-IDF extension, or run `idf.py build` in an activated terminal.
+2. Close serial tools before flashing. If necessary, power off the board,
+   hold BOOT, then power on to enter ROM download mode.
+3. Flash using the ROM COM port: `idf.py -p COMxx flash`.
+4. Return to normal boot (release BOOT and power-cycle if needed).
+5. Find the application's new COM port in Windows Device Manager. Its USB
+   product string is `S31 USB CDC Test`; the COM number may differ from ROM.
 
-- [ESP32 Getting Started Guide](https://docs.espressif.com/projects/esp-idf/en/stable/get-started/index.html)
-- [ESP32-S2 Getting Started Guide](https://docs.espressif.com/projects/esp-idf/en/latest/esp32s2/get-started/index.html)
+Do not expect application CDC to accept another flash automatically.
+Manual BOOT recovery remains necessary in this phase.
 
+## CDC acceptance
 
-## Example folder contents
+Open the application COM port in a serial terminal with DTR asserted,
+115200 / 8N1, no hardware flow control, and local echo disabled.
+The baud setting does not determine the USB bus speed.
 
-The project **hello_world** contains one source file in C language [hello_world_main.c](main/hello_world_main.c). The file is located in folder [main](main).
+- A line like `[CDC] alive=1 heap=... tx_dropped=0` appears every second.
+- Send `hello` followed by Enter; the same bytes return from the device.
+- Close/reopen the terminal and unplug/replug USB; status and echo resume.
+- Send a small multiline text and confirm its echo. Periodic status lines may
+  interleave with echo. This is a bring-up test, not a lossless bulk protocol.
+- DTR must be enabled: the application only transmits when CDC is connected.
+- tx_dropped counts bytes not accepted by the TX queue within the bounded send
+  interval. It does not prove host receipt or count USB RX FIFO overflow.
 
-ESP-IDF projects are built using CMake. The project build configuration is contained in `CMakeLists.txt` files that provide set of directives and instructions describing the project's source files and targets (executable, library, or both).
+Periodic status is sent directly through CDC. printf/ESP_LOG and early boot logs
+still use the existing console configuration, not this new CDC interface.
+High-Speed enumeration and full console redirection remain separate checks.
 
-Below is short explanation of remaining files in the project folder.
+## Implementation references
 
-```
-├── CMakeLists.txt
-├── pytest_hello_world.py      Python script used for automated testing
-├── main
-│   ├── CMakeLists.txt
-│   └── hello_world_main.c
-└── README.md                  This is the file you are currently reading
-```
+- Local IDF examples/peripherals/usb/device/tusb_serial_device.
+- Mosaico factory USB console (commit 2654a4a9):
+  https://github.com/esp-mosaico/esp-mosaico-claw/tree/2654a4a9f76f5d7ea108e4dff7ade7b1df4c1c5c/boards/esp_mosaico/components/usb_hs_console
 
-For more information on structure and contents of ESP-IDF projects, please refer to Section [Build System](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/build-system.html) of the ESP-IDF Programming Guide.
-
-## Troubleshooting
-
-* Program upload failure
-
-    * Hardware connection is not correct: run `idf.py -p PORT monitor`, and reboot your board to see if there are any output logs.
-    * The baud rate for downloading is too high: lower your baud rate in the `menuconfig` menu, and try again.
-
-## Technical support and feedback
-
-Please use the following feedback channels:
-
-* For technical queries, go to the [esp32.com](https://esp32.com/) forum
-* For a feature request or bug report, create a [GitHub issue](https://github.com/espressif/esp-idf/issues)
-
-We will get back to you as soon as possible.
+Only its HS USB shutdown workaround is used here, not its auto-download logic.
+The original Hello World pytest was removed because it no longer describes
+this firmware. Acceptance requires a physical USB host and board.

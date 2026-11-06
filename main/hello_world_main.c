@@ -1,54 +1,93 @@
-/*
- * SPDX-FileCopyrightText: 2010-2026 Espressif Systems (Shanghai) CO LTD
- *
- * SPDX-License-Identifier: CC0-1.0
- */
-
-#include <stdio.h>
+/* SPDX-License-Identifier: CC0-1.0 */
 #include <inttypes.h>
-#include "sdkconfig.h"
+#include <stdio.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include "esp_err.h"
+#include "esp_log.h"
+#include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "esp_chip_info.h"
-#include "esp_flash.h"
-#include "esp_system.h"
+#include "hal/usb_utmi_ll.h"
+#include "tinyusb.h"
+#include "tinyusb_cdc_acm.h"
+#include "tinyusb_default_config.h"
+#include "tusb.h"
+#include "device/dcd.h"
+
+static TaskHandle_t s_app_task;
+static uint32_t s_tx_dropped;
+
+/* Mosaico workaround: stop HS DMA before a CPU restart reuses RAM. */
+static void usb_shutdown(void)
+{
+    dcd_int_disable(0);
+    usb_utmi_ll_reset_register();
+    usb_utmi_ll_enable_bus_clock(false);
+}
+
+static void cdc_rx_callback(int itf, cdcacm_event_t *event)
+{
+    (void)itf;
+    (void)event;
+    /* Never wait for TX in the USB task. The application task drains RX. */
+    xTaskNotifyGive(s_app_task);
+}
+
+static void cdc_send(const uint8_t *data, size_t length)
+{
+    const TickType_t start = xTaskGetTickCount();
+    size_t sent = 0;
+    while (sent < length && tud_cdc_n_connected(0)
+           && (xTaskGetTickCount() - start) < pdMS_TO_TICKS(100)) {
+        sent += tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0,
+                                          data + sent, length - sent);
+        (void)tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, pdMS_TO_TICKS(20));
+        if (sent < length) {
+            vTaskDelay(1);
+        }
+    }
+    s_tx_dropped += length - sent;
+}
 
 void app_main(void)
 {
-    printf("Hello world!\n");
+    s_app_task = xTaskGetCurrentTaskHandle();
+    const tinyusb_config_t usb_config = TINYUSB_DEFAULT_CONFIG();
+    ESP_ERROR_CHECK(tinyusb_driver_install(&usb_config));
+    ESP_ERROR_CHECK(esp_register_shutdown_handler(usb_shutdown));
+    const tinyusb_config_cdcacm_t cdc_config = {
+        .cdc_port = TINYUSB_CDC_ACM_0,
+        .callback_rx = cdc_rx_callback,
+    };
+    ESP_ERROR_CHECK(tinyusb_cdcacm_init(&cdc_config));
+    ESP_LOGI("usb_cdc", "CDC ready: open the application COM port with DTR enabled");
 
-    /* Print chip information */
-    esp_chip_info_t chip_info;
-    uint32_t flash_size;
-    esp_chip_info(&chip_info);
-    printf("This is %s chip with %d CPU core(s), %s%s%s%s%s%s, ",
-           CONFIG_IDF_TARGET,
-           chip_info.cores,
-           (chip_info.features & CHIP_FEATURE_WIFI_BGN) ? "WiFi" : "",
-           ((chip_info.features & CHIP_FEATURE_WIFI_BGN) && (chip_info.features & (CHIP_FEATURE_BT | CHIP_FEATURE_BLE))) ? "/" : "",
-           (chip_info.features & CHIP_FEATURE_BT) ? "BT" : "",
-           ((chip_info.features & CHIP_FEATURE_BT) && (chip_info.features & CHIP_FEATURE_BLE)) ? "/" : "",
-           (chip_info.features & CHIP_FEATURE_BLE) ? "BLE" : "",
-           (chip_info.features & CHIP_FEATURE_IEEE802154) ? ", 802.15.4 (Zigbee/Thread)" : "");
-
-    unsigned major_rev = chip_info.revision / 100;
-    unsigned minor_rev = chip_info.revision % 100;
-    printf("silicon revision v%d.%d, ", major_rev, minor_rev);
-    if(esp_flash_get_size(NULL, &flash_size) != ESP_OK) {
-        printf("Get flash size failed");
-        return;
+    uint8_t rx[CONFIG_TINYUSB_CDC_RX_BUFSIZE];
+    TickType_t last_status = xTaskGetTickCount();
+    uint32_t status_count = 0;
+    while (true) {
+        /* Poll too, including RX received during initialization. */
+        (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10));
+        size_t received = 0;
+        ESP_ERROR_CHECK(tinyusb_cdcacm_read(TINYUSB_CDC_ACM_0, rx,
+                                           sizeof(rx), &received));
+        if (received > 0) {
+            cdc_send(rx, received);
+        }
+        const TickType_t now = xTaskGetTickCount();
+        if (now - last_status >= pdMS_TO_TICKS(1000)) {
+            last_status = now;
+            if (tud_cdc_n_connected(0)) {
+                char status[160];
+                int length = snprintf(status, sizeof(status),
+                                      "\r\n[CDC] alive=%" PRIu32
+                                      " heap=%" PRIu32 " tx_dropped=%" PRIu32 "\r\n",
+                                      ++status_count, esp_get_free_heap_size(), s_tx_dropped);
+                if (length > 0 && length < (int)sizeof(status)) {
+                    cdc_send((const uint8_t *)status, (size_t)length);
+                }
+            }
+        }
     }
-
-    printf("%" PRIu32 "MB %s flash\n", flash_size / (uint32_t)(1024 * 1024),
-           (chip_info.features & CHIP_FEATURE_EMB_FLASH) ? "embedded" : "external");
-
-    printf("Minimum free heap size: %" PRIu32 " bytes\n", esp_get_minimum_free_heap_size());
-
-    for (int i = 10; i >= 0; i--) {
-        printf("Restarting in %d seconds...\n", i);
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
-    }
-    printf("Restarting now.\n");
-    fflush(stdout);
-    esp_restart();
 }
