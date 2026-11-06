@@ -16,6 +16,8 @@
 #include "vfs_tinyusb.h"
 #include "tusb.h"
 #include "device/dcd.h"
+#include "usb_storage.h"
+#include "tinyusb_msc.h"
 
 static TaskHandle_t s_app_task;
 static uint32_t s_tx_dropped;
@@ -39,7 +41,20 @@ static void cdc_rx_callback(int itf, cdcacm_event_t *event)
 void app_main(void)
 {
     s_app_task = xTaskGetCurrentTaskHandle();
-    const tinyusb_config_t usb_config = TINYUSB_DEFAULT_CONFIG();
+    const esp_err_t storage_result = usb_storage_init();
+    if (storage_result != ESP_OK) {
+        ESP_LOGE("usb_storage", "Storage unavailable: %s; keeping CDC active",
+                 esp_err_to_name(storage_result));
+        /* Media failures leave an installed MSC driver with no media.
+         * If driver installation itself failed, install one before USB callbacks. */
+        const tinyusb_msc_driver_config_t fallback = {
+            .user_flags.auto_mount_off = 1,
+        };
+        const esp_err_t driver_result = tinyusb_msc_install_driver(&fallback);
+        ESP_ERROR_CHECK(driver_result == ESP_ERR_INVALID_STATE ? ESP_OK : driver_result);
+    }
+    /* One stack and built-in CDC+MSC FS/HS descriptors. */
+    const tinyusb_config_t usb_config = TINYUSB_CONFIG_HIGH_SPEED(NULL, NULL);
     ESP_ERROR_CHECK(tinyusb_driver_install(&usb_config));
     ESP_ERROR_CHECK(esp_register_shutdown_handler(usb_shutdown));
     const tinyusb_config_cdcacm_t cdc_config = {
@@ -75,6 +90,15 @@ void app_main(void)
             last_status = now;
             if (tud_cdc_n_connected(0)) {
                 clearerr(stdout);
+                printf("\r\n[USB] speed=%s flash_bytes=%" PRIu32 " msc_bytes=%" PRIu32 " owner=%s\r\n",
+                       tud_speed_get() == TUSB_SPEED_HIGH ? "HIGH (480 Mbps)" : "FULL (12 Mbps)",
+                       usb_storage_flash_bytes(), usb_storage_capacity_bytes(),
+                       storage_result == ESP_OK ? "HOST" : "UNAVAILABLE");
+                if (storage_result != ESP_OK) {
+                    ESP_LOGE("usb_storage", "MSC unavailable: %s; media preserved. "
+                             "Back up before erasing only msc_fat (0x110000, 0xef0000)",
+                             esp_err_to_name(storage_result));
+                }
                 printf("\r\n[printf] alive=%" PRIu32 " heap=%" PRIu32
                        " echo_tx_dropped=%" PRIu32 "\r\n",
                        ++status_count, esp_get_free_heap_size(), s_tx_dropped);

@@ -1,85 +1,110 @@
-# ESP32-S31 USB CDC bring-up
+# ESP32-S31 CDC + Flash MSC (phase 2)
 
-Phase 1 for ESP-Mosaico: one TinyUSB CDC-ACM interface, byte echo and a
-status line every second. No MSC or automatic download yet.
+One TinyUSB instance exports CDC-ACM and MSC over Mosaico's USB-OTG Type-C.
+CDC retains byte echo, printf and ESP_LOG output. No auto-download yet.
 
-## Environment and dependencies
+## Versions
 
-- Local ESP-IDF: D:/esp_idf/master/esp-idf, 6.2.0, commit d445e947.
-- Target: esp32s31.
-- main/idf_component.yml follows the local tusb_serial_device example:
-  esp_tinyusb ~3.0.0. The actual patch and transitive TinyUSB versions will
-  be resolved on the user's first configure/build. Commit dependencies.lock
-  after successful dependency resolution; it has not been generated yet.
-- sdkconfig is tracked to preserve the working board configuration.
-- sdkconfig.defaults adds the CDC settings for fresh configurations. It is
-  not a complete replacement for the tracked board configuration.
-- Existing 2 MB flash configuration and single-app partition table are unchanged.
+ESP-IDF 6.2.0, local revision d445e947; esp_tinyusb 3.0.0 is recorded in
+dependencies.lock. Implementation follows the installed component and local
+examples/peripherals/usb/device/tusb_composite_msc_serialdevice.
+
+## Flash layout and pre-flash requirement
+
+The user reports 16 MiB of program SPI NOR flash. Configuration now uses
+16 MiB; verify this is program NOR (not SPI NAND) before flashing. The runtime
+check requires at least 16 MiB. ROM `esptool --chip esp32s31 -p COMxx flash-id`
+can independently confirm the physical capacity.
+
+| Region | Offset | Size | End (exclusive) |
+| --- | --- | --- | --- |
+| Partition table | 0x8000 | 0x1000 | 0x9000 |
+| NVS | 0x9000 | 0x6000 | 0xf000 |
+| PHY | 0xf000 | 0x1000 | 0x10000 |
+| Factory app | 0x10000 | 0x100000 | 0x110000 |
+| msc_fat | 0x110000 | 0xef0000 | 0x1000000 |
+
+Original NVS/PHY/app offsets and sizes are preserved. No OTA partitions.
+MSC uses the remaining 14.9375 MiB of the 16 MiB chip. Wear levelling metadata
+and FAT structures reduce the capacity/free space visible to the host.
+
+The firmware checks the named partition's offset/size and reported flash size
+before initializing storage. These runtime checks do not replace the pre-flash
+capacity check: an oversized flash header may prevent boot before app_main.
+
+## Ownership and formatting
+
+Only msc_fat is passed to wl_mount. Before USB starts, firmware temporarily
+registers the wear-levelled disk with FatFs and checks the filesystem. A valid
+FAT volume is preserved. Only FR_NO_FILESYSTEM plus a completely erased (all
+0xff) logical disk permits automatic FAT creation. Read errors, internal FAT
+errors and nonblank disks without a valid FAT fail without automatic formatting.
+The filesystem and temporary diskio registration are removed before creating
+MSC with owner USB, auto_mount_off=1 and do_not_format=true. Disconnect/eject
+never mounts FAT in the application. No application file operations run while
+USB owns storage. First initialization can delay USB enumeration.
+
+Migration from the old 2 MiB partition is not an in-place filesystem resize.
+Back up files before flashing the new partition table: wear-levelling metadata
+locations depend on partition size, and old data may become unreadable. Old
+metadata may also make the expanded disk nonblank, causing the safety check to
+refuse initialization. In that case, after backup, erase only msc_fat through a
+separate deliberate maintenance operation; do not erase the whole chip. No
+migration erase is performed by this firmware. A blank partition initializes
+on the next boot without a Windows format prompt. A power failure during first
+format can similarly leave a nonblank incomplete filesystem requiring recovery.
+
+Do not write a raw FAT image to msc_fat: the host sees the wear-levelled logical
+disk, not the raw partition layout. Unexpected format prompts after files exist
+are failures to investigate, not instructions to reformat.
 
 ## User build and flash
 
-The agent has not configured, compiled, linked, generated firmware, or flashed.
-Use the same ESP-IDF environment and flashing method that worked for Hello World.
-The first build needs network access to download the managed USB components.
+The agent did not build, link, generate images, flash, or commit this phase.
 
-1. Build from the ESP-IDF extension, or run `idf.py build` in an activated terminal.
-2. Close serial tools before flashing. If necessary, power off the board,
-   hold BOOT, then power on to enter ROM download mode.
-3. Flash using the ROM COM port: `idf.py -p COMxx flash`.
-4. Return to normal boot (release BOOT and power-cycle if needed).
-5. Find the application's new COM port in Windows Device Manager. Its USB
-   product string is `S31 USB CDC Test`; the COM number may differ from ROM.
+1. Confirm program NOR capacity as above; keep the ROM COM number.
+2. Build with the existing IDF setup (`idf.py build` or extension).
+3. Manually enter ROM with BOOT and power-on; close XCOM first.
+4. Use a full project flash (`idf.py -p COMxx flash`), not app-only flash.
+   The updated bootloader/header and partition table must also be written.
+   Do not use erase-flash; it removes NVS and test files.
+5. Release BOOT and return to normal application boot.
 
-Do not expect application CDC to accept another flash automatically.
-Manual BOOT recovery remains necessary in this phase.
+A new composite PID/interface layout may assign a different application COM
+number. Product string: S31 USB CDC MSC Test. Automatic flash/reset through the
+application COM is not implemented; retain manual BOOT recovery.
 
-## CDC acceptance
+## Acceptance
 
-Open the application COM port in a serial terminal with DTR asserted,
-115200 / 8N1, no hardware flow control, and local echo disabled.
-The baud setting does not determine the USB bus speed.
+- A blank MSC partition initializes FAT before USB enumeration, without a Windows format prompt.
+- Same Type-C cable exposes a COM port and an approximately 14.9 MiB removable disk.
+- Open the COM in XCOM: DTR on, hardware flow control off, 115200/8N1.
+- Every second: [USB], [printf], [ESP_LOGI]. Sending hello echoes the bytes.
+- The [USB] line reports speed, reported flash bytes and logical MSC bytes.
+  Runtime flash size may reflect the configured addressable size, not the full
+  physical capacity; flash-id is the pre-flash capacity evidence.
+- While copying a small file to the disk, status and echo should keep working.
+  NOR writes can add latency; HS bus rate does not equal flash write throughput.
+- Record SHA256 of a source file (`Get-FileHash path -Algorithm SHA256`), copy
+  it to the disk, safely eject, unplug/power-cycle, reconnect and compare hash
+  of the stored copy. The hash must match and no format prompt should recur.
+- Close/reopen COM and unplug/replug; logs and echo must resume.
+- Confirm current negotiated speed with a host USB tree viewer: High-Speed,
+  480 Mbps, not merely USB 2.0 capability/bcdUSB. Cross-check [USB] speed=HIGH.
+  If FULL, record cable/hub/topology; enumeration alone is not HS evidence.
 
-- A line like `[CDC] alive=1 heap=... tx_dropped=0` appears every second.
-- Send `hello` followed by Enter; the same bytes return from the device.
-- Close/reopen the terminal and unplug/replug USB; status and echo resume.
-- Send a small multiline text and confirm its echo. Periodic status lines may
-  interleave with echo. This is a bring-up test, not a lossless bulk protocol.
-- DTR must be enabled: the application only transmits when CDC is connected.
-- tx_dropped counts bytes not accepted by the TX queue within the bounded send
-  interval. It does not prove host receipt or count USB RX FIFO overflow.
+Safely eject before power-off or another flash. Use a small file below the
+reported free space. Sudden power loss during writing is not guaranteed safe.
 
-Periodic status is sent directly through CDC. printf/ESP_LOG and early boot logs
-still use the existing console configuration, not this new CDC interface.
-High-Speed enumeration and full console redirection remain separate checks.
+## Implementation
 
-## Implementation references
+main/usb_storage.c owns wear levelling and MSC setup. Async MSC storage I/O
+keeps flash work off the USB servicing task. Default FS/HS descriptors combine
+CDC and MSC. No independent USB stack or runtime device-side FAT consumer is installed.
 
-- Local IDF examples/peripherals/usb/device/tusb_serial_device.
-- Mosaico factory USB console (commit 2654a4a9):
-  https://github.com/esp-mosaico/esp-mosaico-claw/tree/2654a4a9f76f5d7ea108e4dff7ade7b1df4c1c5c/boards/esp_mosaico/components/usb_hs_console
+CDC uses tinyusb_console_init. RX has one reader in app_main, echo uses stdout,
+and VFS TX is nonblocking: slow/absent hosts can lose logs. echo_tx_dropped only
+counts short echo writes. Initialization/ROM/panic logs are not replayed later.
 
-Only its HS USB shutdown workaround is used here, not its auto-download logic.
-The original Hello World pytest was removed because it no longer describes
-this firmware. Acceptance requires a physical USB host and board.
-
-## CDC standard console
-
-The application calls tinyusb_console_init after CDC initialization,
-matching the factory firmware's console hookup. printf, stderr and normal
-ESP_LOG output after initialization use CDC. The existing task still owns
-RX and echoes via fwrite on stdout; do not add another stdin reader.
-
-The resolved local esp_tinyusb version is 3.0.0 (see dependencies.lock).
-This supersedes the earlier note that dependency resolution is pending.
-
-After the user builds/flashes, enable DTR and expect both [printf] and
-[ESP_LOGI] lines every second. Echo, close/reopen and unplug/replug must
-still work. Startup messages before CDC initialization and ROM/panic output
-are not guaranteed on this application USB interface. Initial messages can
-be missed before the host opens its port; periodic lines provide validation.
-
-The component VFS uses nonblocking TX. A slow or absent host can lose output;
-this is live logging without history or a delivery guarantee. echo_tx_dropped
-only counts short echo writes, not lost log bytes. TX newline conversion is
-LF (unchanged bytes), preserving exact echo, and printf supplies explicit CRLF.
-The agent did not build or flash this console change; hardware validation remains a user step.
+The HS USB shutdown workaround follows Mosaico factory usb_hs_console at
+commit 2654a4a9, without importing its download/reset trigger.
